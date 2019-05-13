@@ -26,6 +26,7 @@
 #define MMU_P0_TIMEOUT 3000ul //timeout for P0 command: 3seconds
 #define MMU_MAX_RESEND_ATTEMPTS 2
 
+
 #ifdef MMU_HWRESET
 #define MMU_RST_PIN 76
 #endif //MMU_HWRESET
@@ -682,7 +683,6 @@ void manage_response(bool move_axes, bool turn_off_nozzle, uint8_t move)
 				  st_synchronize();
 				  mmu_print_saved = true;
 				  printf_P(PSTR("MMU not responding\n"));
-          KEEPALIVE_STATE(PAUSED_FOR_USER);
 				  hotend_temp_bckp = degTargetHotend(active_extruder);
 				  if (move_axes) {
 					  z_position_bckp = current_position[Z_AXIS];
@@ -739,7 +739,6 @@ void manage_response(bool move_axes, bool turn_off_nozzle, uint8_t move)
 		  }
 		  else if (mmu_print_saved) {
 			  printf_P(PSTR("MMU starts responding\n"));
-        KEEPALIVE_STATE(IN_HANDLER);
 			  mmu_loading_flag = false;
 			  if (turn_off_nozzle) 
 			  {
@@ -883,7 +882,7 @@ void mmu_M600_load_filament(bool automatic, float nozzle_temp)
     mmu_command(MmuCmd::T0 + tmp_extruder);
 
     manage_response(false, true, MMU_LOAD_MOVE);
-    mmu_continue_loading(is_usb_printing);
+    mmu_continue_loading();
     mmu_extruder = tmp_extruder; //filament change is finished
 
     mmu_load_to_nozzle();
@@ -1368,7 +1367,7 @@ bFilamentAction=false;                            // NOT in "mmu_load_to_nozzle_
 	lcd_print(tmp_extruder + 1);
 	mmu_command(MmuCmd::T0 + tmp_extruder);
 	manage_response(true, true, MMU_TCODE_MOVE);
-	mmu_continue_loading(false);
+	mmu_continue_loading();
 	mmu_extruder = tmp_extruder; //filament change is finished
 	mmu_load_to_nozzle();
 	load_filament_final_feed();
@@ -1474,61 +1473,18 @@ static void load_more()
     st_synchronize();
 }
 
-static void increment_load_fail()
+void mmu_continue_loading() 
+{
+	if (ir_sensor_detected)
 	{
-	    uint8_t mmu_load_fail = eeprom_read_byte((uint8_t*)EEPROM_MMU_LOAD_FAIL);
+	    load_more();
+
+		if (PIN_GET(IR_SENSOR_PIN) != FILAMENT_PRESENT_STATE) {
+			uint8_t mmu_load_fail = eeprom_read_byte((uint8_t*)EEPROM_MMU_LOAD_FAIL);
 			uint16_t mmu_load_fail_tot = eeprom_read_word((uint16_t*)EEPROM_MMU_LOAD_FAIL_TOT);
 			if(mmu_load_fail < 255) eeprom_update_byte((uint8_t*)EEPROM_MMU_LOAD_FAIL, mmu_load_fail + 1);
 			if(mmu_load_fail_tot < 65535) eeprom_update_word((uint16_t*)EEPROM_MMU_LOAD_FAIL_TOT, mmu_load_fail_tot + 1);
-}
 
-//! @brief continue loading filament
-//! @par blocking
-//!  * true blocking - do not return until successful load
-//!  * false non-blocking - pause print and return on load failure
-//!
-//! @startuml
-//! [*] --> [*] : !ir_sensor_detected /\n send MmuCmd::C0
-//! [*] --> LoadMore
-//! LoadMore --> [*] : filament \ndetected
-//! LoadMore --> Retry : !filament detected /\n increment load fail
-//! Retry --> [*] : filament \ndetected
-//! Retry --> Unload : !filament \ndetected
-//! Unload --> [*] : non-blocking
-//! Unload --> Retry : button \nclicked
-//!
-//! Retry : Cut filament if enabled
-//! Retry : repeat last T-code
-//! Unload : unload filament
-//! Unload : pause print
-//! Unload : show error message
-//!
-//! @enduml
-void mmu_continue_loading(bool blocking)
-{
-  if (!ir_sensor_detected)
-  {
-      mmu_command(MmuCmd::C0);
-      return;
-  }
-
-    load_more();
-    enum class Ls : uint_least8_t
-    {
-        enter,
-        retry,
-        unload,
-    };
-    Ls state = Ls::enter;
-
-    while (PIN_GET(IR_SENSOR_PIN) != 0)
-    {
-        switch (state)
-        {
-        case Ls::enter:
-            increment_load_fail();
-            // no break
-        case Ls::retry:
 #ifdef MMU_HAS_CUTTER
 			if (1 == eeprom_read_byte((uint8_t*)EEPROM_MMU_CUTTER_ENABLED))
 			{
@@ -1536,12 +1492,14 @@ void mmu_continue_loading(bool blocking)
 			    manage_response(true, true, MMU_UNLOAD_MOVE);
 			}
 #endif //MMU_HAS_CUTTER
+
             mmu_command(MmuCmd::T0 + tmp_extruder);
             manage_response(true, true, MMU_TCODE_MOVE);
             load_more();
-            state = Ls::unload;
-            break;
-        case Ls::unload:
+
+            if (PIN_GET(IR_SENSOR_PIN) != FILAMENT_PRESENT_STATE)
+            {
+                //pause print, show error message and then repeat last T-code
                 stop_and_save_print_to_ram(0, 0);
 
                 //lift z
@@ -1560,22 +1518,14 @@ void mmu_continue_loading(bool blocking)
                 manage_response(false, true, MMU_UNLOAD_MOVE);
 
                 setAllTargetHotends(0);
-                lcd_setstatuspgm(_i("MMU load failed     "));////c=20 r=1
-
-            if (blocking)
-            {
-                marlin_wait_for_click();
-                restore_print_from_ram_and_continue(0);
-                state = Ls::retry;
-            }
-            else
-            {
+                lcd_setstatuspgm(_i("MMU load failed     "));////MSG_RECOVERING_PRINT c=20 r=1
                 mmu_fil_loaded = false; //so we can retry same T-code again
                 isPrintPaused = true;
                 mmu_command(MmuCmd::W0);
-                return;
             }
-            break;
 		}
+	}
+	else { //mmu_ir_sensor_detected == false
+		mmu_command(MmuCmd::C0);
 	}
 }
